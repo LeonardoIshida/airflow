@@ -106,6 +106,7 @@ from airflow.sdk.execution_time.comms import (
     SentFDs,
     SetRenderedFields,
     SetRenderedMapIndex,
+    SetTaskExecutionTimeout,
     SetXCom,
     SkipDownstreamTasks,
     StartupDetails,
@@ -939,6 +940,9 @@ class ActivitySubprocess(WatchedSubprocess):
     _task_end_time_monotonic: float | None = attrs.field(default=None, init=False)
     _rendered_map_index: str | None = attrs.field(default=None, init=False)
 
+    _execution_timeout_seconds: float | None = attrs.field(default=None, init=False)
+    """The execution timeout in seconds, if set by the task. Timer starts from process start_time."""
+
     decoder: ClassVar[TypeAdapter[ToSupervisor]] = TypeAdapter(ToSupervisor)
 
     ti: RuntimeTI | None = None
@@ -1078,6 +1082,9 @@ class ActivitySubprocess(WatchedSubprocess):
                 # logs
                 self._send_heartbeat_if_needed()
 
+                # Check if task has exceeded execution_timeout
+                self._check_task_timeout()
+
                 self._handle_process_overtime_if_needed()
 
     def _handle_process_overtime_if_needed(self):
@@ -1096,6 +1103,45 @@ class ActivitySubprocess(WatchedSubprocess):
                 ti_id=self.id,
             )
             self.kill(signal.SIGTERM, force=True)
+
+    def _check_task_timeout(self):
+        """
+        Check if task has exceeded execution_timeout and kill it if necessary.
+
+        This handles task timeout at the supervisor level rather than in the task
+        process itself.
+
+        The method implements signal escalation: SIGTERM -> SIGKILL if process doesn't exit.
+        """
+        # Only check timeout if we have a timeout set
+        if self._execution_timeout_seconds is None:
+            return
+
+        # Don't check timeout if task has already reached a terminal state
+        if self._terminal_state:
+            return
+
+        elapsed_time = time.monotonic() - self.start_time
+
+        if elapsed_time > self._execution_timeout_seconds:
+            log.error(
+                "Task execution timeout exceeded; terminating process",
+                timeout_seconds=self._execution_timeout_seconds,
+                elapsed_seconds=elapsed_time,
+                ti_id=self.id,
+                pid=self.pid,
+            )
+            self.process_log.error(
+                "Task execution timeout exceeded. Terminating process.",
+                timeout_seconds=self._execution_timeout_seconds,
+                elapsed_seconds=elapsed_time,
+            )
+
+            # Kill the process with signal escalation (SIGTERM -> SIGKILL)
+            self.kill(signal.SIGTERM, force=True)
+
+            self._terminal_state = TaskInstanceState.FAILED
+            self._task_end_time_monotonic = time.monotonic()
 
     def _send_heartbeat_if_needed(self):
         """Send a heartbeat to the client if heartbeat interval has passed."""
@@ -1382,6 +1428,8 @@ class ActivitySubprocess(WatchedSubprocess):
             inactive_assets_resp = self.client.task_instances.validate_inlets_and_outlets(msg.ti_id)
             resp = InactiveAssetsResult.from_inactive_assets_response(inactive_assets_resp)
             dump_opts = {"exclude_unset": True}
+        elif isinstance(msg, SetTaskExecutionTimeout):
+            self._execution_timeout_seconds = msg.execution_timeout_seconds
         elif isinstance(msg, ResendLoggingFD):
             # We need special handling here!
             if send_fds is not None:
